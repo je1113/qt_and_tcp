@@ -20,8 +20,9 @@
     {"type": "command", "id": n, "cmd": "movej", "joints": [j1, ..., j6]}  목표 관절각으로 이동
     {"type": "command", "id": n, "cmd": "home"}                            모든 관절 0°로 이동
     {"type": "command", "id": n, "cmd": "stop"}                            그 자리에서 정지
+    {"type": "heartbeat"}   살아 있다는 신호. --client-timeout 초 동안 아무것도 안 오면 연결을 끊는다.
 
-실행: python3 bridge/mock_m0609.py [--port 5000] [--period 0.5]
+실행: python3 bridge/mock_m0609.py [--port 5000] [--period 0.5] [--client-timeout 3]
 """
 
 import argparse
@@ -121,9 +122,12 @@ def send_message(writer, msg):
     writer.write(header + body)
 
 
-async def read_message(reader):
-    """메시지 하나를 받는다. readexactly가 'N바이트가 다 모일 때까지' 기다려 준다."""
-    header = await reader.readexactly(HEADER_SIZE)
+async def read_message(reader, timeout):
+    """메시지 하나를 받는다. readexactly가 'N바이트가 다 모일 때까지' 기다려 준다.
+
+    timeout초 안에 다음 메시지가 시작되지 않으면 TimeoutError. (timeout이 0이면 무한정 기다림)
+    """
+    header = await asyncio.wait_for(reader.readexactly(HEADER_SIZE), timeout or None)
     (body_size,) = struct.unpack(">I", header)
     if body_size > MAX_BODY_SIZE:
         raise ValueError(f"메시지 길이 이상 ({body_size}바이트)")
@@ -143,25 +147,25 @@ async def send_status_loop(writer, robot, period):
         seq = seq + 1
 
 
-async def receive_command_loop(reader, writer, robot):
+async def receive_command_loop(reader, writer, robot, client_timeout):
     """연결이 끊길 때까지 명령을 받아 실행하고 ack를 보낸다."""
     while True:
-        msg = await read_message(reader)
-        print(f"[명령] {msg}")
+        msg = await read_message(reader, client_timeout)
         if msg.get("type") != "command":
-            continue
+            continue                  # heartbeat 등은 '살아 있다'는 것만 알려 주면 충분하다
+        print(f"[명령] {msg}")
         send_message(writer, handle_command(robot, msg))
         await writer.drain()
 
 
-async def handle_client(reader, writer, robot, period):
+async def handle_client(reader, writer, robot, period, client_timeout):
     """클라이언트 하나가 접속하면 실행된다. 보내기/받기 두 작업을 동시에 돌린다."""
     addr = writer.get_extra_info("peername")
     print(f"[연결] {addr}")
 
     tasks = [
         asyncio.create_task(send_status_loop(writer, robot, period)),
-        asyncio.create_task(receive_command_loop(reader, writer, robot)),
+        asyncio.create_task(receive_command_loop(reader, writer, robot, client_timeout)),
     ]
     try:
         # 둘 중 하나라도 끝나면(대부분 연결이 끊긴 경우) 이 연결은 끝난 것이다.
@@ -170,6 +174,8 @@ async def handle_client(reader, writer, robot, period):
             error = task.exception()
             if isinstance(error, (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError)):
                 pass                  # 클라이언트가 끊은 경우
+            elif isinstance(error, TimeoutError):
+                print(f"[하트비트 없음] {addr}: {client_timeout}초 동안 수신 없음")
             elif error is not None:
                 print(f"[오류] {addr}: {error!r}")
     finally:
@@ -185,12 +191,14 @@ async def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--period", type=float, default=0.5, help="상태 전송 주기 [초]")
+    parser.add_argument("--client-timeout", type=float, default=3.0,
+                        help="이 시간[초] 동안 클라이언트에게서 아무것도 안 오면 끊는다. 0 = 끄기")
     args = parser.parse_args()
 
     robot = MockM0609()
 
     server = await asyncio.start_server(
-        lambda r, w: handle_client(r, w, robot, args.period),
+        lambda r, w: handle_client(r, w, robot, args.period, args.client_timeout),
         args.host,
         args.port,
     )

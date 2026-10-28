@@ -15,6 +15,7 @@
 #include <QSpinBox>
 #include <QTcpSocket>
 #include <QTime>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <QtEndian>
 
@@ -106,16 +107,37 @@ MainWindow::MainWindow(QWidget *parent)
 
     socket = new QTcpSocket(this);
 
+    heartbeatTimer = new QTimer(this);
+    heartbeatTimer->setInterval(HeartbeatIntervalMs);
+
+    watchdogTimer = new QTimer(this);
+    watchdogTimer->setSingleShot(true);
+    watchdogTimer->setInterval(HeartbeatTimeoutMs);
+
+    reconnectTimer = new QTimer(this);
+    reconnectTimer->setSingleShot(true);
+
+    ackTimer = new QTimer(this);
+    ackTimer->setSingleShot(true);
+    ackTimer->setInterval(AckTimeoutMs);
+
     // 버튼 클릭 → 우리 슬롯
     connect(connectButton, &QPushButton::clicked, this, &MainWindow::onConnectClicked);
     connect(disconnectButton, &QPushButton::clicked, this, &MainWindow::onDisconnectClicked);
     connect(moveJButton, &QPushButton::clicked, this, &MainWindow::onMoveJClicked);
     connect(homeButton, &QPushButton::clicked, this, &MainWindow::onHomeClicked);
     connect(stopButton, &QPushButton::clicked, this, &MainWindow::onStopClicked);
+    
     // 소켓 상태 변화/오류 → 우리 슬롯
     connect(socket, &QTcpSocket::stateChanged, this, &MainWindow::onStateChanged);
     connect(socket, &QTcpSocket::errorOccurred, this, &MainWindow::onErrorOccurred);
     connect(socket, &QTcpSocket::readyRead, this, &MainWindow::onReadyRead);
+
+    // 타이머 → 우리 슬롯
+    connect(heartbeatTimer, &QTimer::timeout, this, &MainWindow::onHeartbeatTimeout);
+    connect(watchdogTimer, &QTimer::timeout, this, &MainWindow::onWatchdogTimeout);
+    connect(reconnectTimer, &QTimer::timeout, this, &MainWindow::startConnecting);
+    connect(ackTimer, &QTimer::timeout, this, &MainWindow::onAckTimeout);
 
     // 시작 시점의 화면도 같은 함수로 맞춘다.
     onStateChanged(socket->state());
@@ -131,6 +153,13 @@ MainWindow::~MainWindow()
 
 void MainWindow::onConnectClicked()
 {
+    autoReconnect = true;
+    reconnectDelayMs = InitialReconnectDelayMs;
+    startConnecting();
+}
+
+void MainWindow::startConnecting()
+{
     // 이전 연결에서 남은 반쪽 메시지가 새 연결의 데이터와 섞이지 않게 비운다.
     buffer.clear();
     lastSeq = -1;
@@ -141,11 +170,34 @@ void MainWindow::onConnectClicked()
 
 void MainWindow::onDisconnectClicked()
 {
-    socket->disconnectFromHost();
+    // 사용자가 직접 끊은 것이므로 재연결하지 않는다.
+    autoReconnect = false;
+    if (reconnectTimer->isActive()) {
+        reconnectTimer->stop();
+        appendLog("재연결 취소");
+    }
+
+    if (socket->state() == QAbstractSocket::ConnectedState)
+        socket->disconnectFromHost();  // 보내던 데이터를 마저 보내고 정상 종료
+    else
+        socket->abort();               // 연결 시도 중이면 바로 취소
+
+    updateControls();
+}
+
+void MainWindow::scheduleReconnect()
+{
+    statusLabel->setText(QString("재연결 대기 (%1초 후)").arg(reconnectDelayMs / 1000.0));
+    appendLog(statusLabel->text());
+    reconnectTimer->start(reconnectDelayMs);
+    reconnectDelayMs = reconnectDelayMs * 2;
+    reconnectDelayMs = qMin(reconnectDelayMs, MaxReconnectDelayMs);
 }
 
 void MainWindow::onStateChanged(QAbstractSocket::SocketState state)
 {
+    const QString before = statusLabel->text();
+
     switch (state) {
     case QAbstractSocket::UnconnectedState:
         statusLabel->setText("연결 안 됨");
@@ -163,19 +215,52 @@ void MainWindow::onStateChanged(QAbstractSocket::SocketState state)
     default:
         break;
     }
-    appendLog(statusLabel->text());
+    // HostLookup → Connecting처럼 문구가 같은 상태가 연달아 오면 로그에 한 번만 남긴다.
+    if (statusLabel->text() != before)
+        appendLog(statusLabel->text());
 
-    // 연결이 안 된 상태에서만 주소를 바꾸고 [연결]을 누를 수 있게 한다.
-    const bool idle = (state == QAbstractSocket::UnconnectedState);
-    hostEdit->setEnabled(idle);
-    portSpin->setEnabled(idle);
-    connectButton->setEnabled(idle);
+    if (state == QAbstractSocket::ConnectedState) {
+        reconnectDelayMs = InitialReconnectDelayMs;  // 연결에 성공했으니 다음 재연결은 처음 간격부터
+        heartbeatTimer->start();
+        watchdogTimer->start();
+    } else if (state == QAbstractSocket::UnconnectedState) {
+        heartbeatTimer->stop();
+        watchdogTimer->stop();
+        ackTimer->stop();
+        pendingCommandId = 0;
+        robotState.clear();  // 연결이 없으면 로봇 상태도 알 수 없다.
 
-    // 연결된 상태에서만 [해제]와 명령을 쓸 수 있게 한다.
+        if (autoReconnect)
+            scheduleReconnect();
+    }
+
+    updateControls();
+}
+
+void MainWindow::updateControls()
+{
+    // 버튼 활성화는 여러 조건(소켓 상태, 재연결 모드, 로봇 상태, ack 대기)에 따라 정해진다.
+    // 조건이 바뀌는 곳에서는 이 함수만 부르면 되도록, 계산은 전부 여기서 한다.
+    const QAbstractSocket::SocketState state = socket->state();
     const bool connected = (state == QAbstractSocket::ConnectedState);
-    disconnectButton->setEnabled(connected);
-    moveJButton->setEnabled(connected);
-    homeButton->setEnabled(connected);
+
+    // 재연결 모드가 꺼져 있고 완전히 끊긴 상태에서만 주소를 바꾸고 [연결]을 누를 수 있다.
+    const bool canConnect = !autoReconnect && state == QAbstractSocket::UnconnectedState;
+    hostEdit->setEnabled(canConnect);
+    portSpin->setEnabled(canConnect);
+    connectButton->setEnabled(canConnect);
+
+    // 재연결 모드 중이면(연결됨 / 연결 시도 중 / 재연결 대기 중) [해제]로 멈출 수 있다.
+    disconnectButton->setEnabled(autoReconnect);
+
+    // 이동 명령: 연결됨 + 로봇이 멈춰 있음 + 응답을 기다리는 명령 없음
+    const bool canMove = connected && robotState == "IDLE" && pendingCommandId == 0;
+    moveJButton->setEnabled(canMove);
+    homeButton->setEnabled(canMove);
+    for (QDoubleSpinBox *spin : targetSpins)
+        spin->setEnabled(canMove);
+
+    // 정지: 안전을 위해 연결만 되어 있으면 언제나 누를 수 있다.
     stopButton->setEnabled(connected);
 }
 
@@ -192,6 +277,9 @@ void MainWindow::onReadyRead()
     // readyRead는 "메시지 하나"가 아니라 "바이트가 좀 왔다"는 뜻이다.
     // 일단 버퍼에 모아 두고, 완성된 메시지가 있는 만큼 꺼낸다.
     buffer.append(socket->readAll());
+
+    // 뭐라도 왔으면 상대는 살아 있다. watchdog을 처음부터 다시 센다.
+    watchdogTimer->start();
 
     while (buffer.size() >= HeaderSize) {
         const quint32 bodySize = qFromBigEndian<quint32>(buffer.constData());
@@ -225,18 +313,35 @@ void MainWindow::handleMessage(const QByteArray &body)
     const QString type = msg["type"].toString();
 
     if (type == "ack") {
-        const QString head = QString("← #%1 %2").arg(msg["id"].toInt()).arg(msg["cmd"].toString());
-        if (msg["ok"].toBool())
+        const int id = msg["id"].toInt();
+        const QString cmd = msg["cmd"].toString();
+        const bool ok = msg["ok"].toBool();
+
+        const QString head = QString("← #%1 %2").arg(id).arg(cmd);
+        if (ok)
             appendLog(head + " OK");
         else
             appendLog(head + " 실패: " + msg["error"].toString());
+
+        if (id == pendingCommandId) {
+            pendingCommandId = 0;
+            ackTimer->stop();
+
+            // 이동 명령이 받아들여졌으면 다음 status가 오기 전이라도 "움직이는 중"으로 본다.
+            // 그러지 않으면 ack와 다음 status 사이(최대 0.5초) 동안 버튼이 잠깐 풀린다.
+            if (ok && cmd != "stop")
+                robotState = "MOVING";
+            updateControls();
+        }
         return;
     }
 
     if (type != "status")
         return;
 
-    robotStateLabel->setText(msg["state"].toString());
+    robotState = msg["state"].toString();
+    robotStateLabel->setText(robotState);
+    updateControls();
 
     const QJsonArray joints = msg["joints"].toArray();
     for (int i = 0; i < jointLabels.size() && i < joints.size(); ++i)
@@ -278,6 +383,13 @@ void MainWindow::sendCommand(QJsonObject command)
 
     sendMessage(command);
 
+    // 정지는 언제든 누를 수 있어야 하므로 잠금 대상에서 뺀다. 나머지는 ack가 올 때까지 잠근다.
+    if (command["cmd"].toString() != "stop") {
+        pendingCommandId = command["id"].toInt();
+        ackTimer->start();
+        updateControls();
+    }
+
     // 로그에는 type을 빼고 사람이 보기 쉬운 부분만 남긴다.
     QJsonObject shown = command;
     shown.remove("type");
@@ -303,4 +415,23 @@ void MainWindow::sendMessage(const QJsonObject &msg)
 void MainWindow::appendLog(const QString &text)
 {
     logView->appendPlainText(QTime::currentTime().toString("hh:mm:ss.zzz") + "  " + text);
+}
+
+void MainWindow::onHeartbeatTimeout()
+{
+    // 명령이 아니므로 id도 없고 로그에도 남기지 않는다. "나 살아 있어"라는 신호일 뿐이다.
+    sendMessage(QJsonObject{{"type", "heartbeat"}});
+}
+
+void MainWindow::onWatchdogTimeout()
+{
+    appendLog(QString("하트비트 끊김: %1초 동안 수신 없음").arg(HeartbeatTimeoutMs / 1000));
+    socket->abort();  // 상대가 응답이 없으니 정상 종료 절차 없이 바로 끊는다. → Unconnected → 재연결
+}
+
+void MainWindow::onAckTimeout()
+{
+    appendLog(QString("⚠ #%1 응답 없음 (%2초)").arg(pendingCommandId).arg(AckTimeoutMs / 1000));
+    pendingCommandId = 0;
+    updateControls();
 }
