@@ -16,6 +16,7 @@
 #include <QTcpSocket>
 #include <QTime>
 #include <QTimer>
+#include <QUuid>
 #include <QVBoxLayout>
 #include <QtEndian>
 
@@ -23,6 +24,7 @@ MainWindow::MainWindow(QWidget *parent)
     : QWidget(parent)
 {
     setWindowTitle("TCP Chat");
+    sessionId = QUuid::createUuid().toString(QUuid::WithoutBraces);
     resize(560, 640);
 
     // 위젯들에 this(부모)를 주면, 창이 삭제될 때 Qt가 자식들도 함께 delete 해준다.
@@ -431,6 +433,7 @@ void MainWindow::sendCommand(QJsonObject command)
     // 공통 필드는 여기서 채운다. 버튼마다 type/id를 따로 쓰지 않아도 된다.
     command["type"] = "command";
     command["id"] = nextCommandId++;  // 지금 값을 쓰고 나서 1 늘린다.
+    command["session"] = sessionId;
 
     sendMessage(command);
 
@@ -446,6 +449,7 @@ void MainWindow::sendCommand(QJsonObject command)
     QJsonObject shown = command;
     shown.remove("type");
     shown.remove("id");
+    shown.remove("session");
     appendLog(QString("→ #%1 %2").arg(command["id"].toInt())
                   .arg(QString::fromUtf8(QJsonDocument(shown).toJson(QJsonDocument::Compact))));
 }
@@ -514,7 +518,7 @@ void MainWindow::onAckTimeout()
 void MainWindow::sendQuery()
 {
     pendingQueryId = nextCommandId++;
-    sendMessage(QJsonObject{{"type", "command"}, {"id", pendingQueryId}, {"cmd", "query"}});
+    sendMessage(QJsonObject{{"type", "command"}, {"id", pendingQueryId}, {"cmd", "query"}, {"session", sessionId}});
     ackTimer->start();
     appendLog(QString("→ #%1 query (실제 상태 재조회)").arg(pendingQueryId));
     updateControls();

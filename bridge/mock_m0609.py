@@ -17,11 +17,11 @@
     {"type": "ack", "id": n, "cmd": "movej", "ok": true, "duplicate": true}
     {"type": "ack", "id": n, "cmd": "movej", "ok": false, "error": "이유"}
         - 명령 하나마다 응답 하나. id는 명령의 id를 그대로 돌려준다.
-        - 이미 실행한 id가 다시 오면 실행하지 않고 duplicate=true로 응답한다(재전송해도 안전).
+        - 같은 session에서 이미 실행한 id가 다시 오면 실행하지 않고 duplicate=true로 응답한다(재전송해도 안전).
     {"type": "ack", "id": n, "cmd": "query", "ok": true, "status": {...}, "executed_ids": [...]}
-        - query의 응답. 지금 상태와, 최근에 실행한 명령 id 목록을 돌려준다.
+        - query의 응답. 지금 상태와, 그 session에서 최근에 실행한 명령 id 목록을 돌려준다.
 
-클라이언트 → 브리지
+클라이언트 → 브리지  (모든 command에 "session": "<클라이언트가 켜질 때 만든 UUID>"를 붙인다)
     {"type": "command", "id": n, "cmd": "movej", "joints": [j1, ..., j6]}  목표 관절각으로 이동
     {"type": "command", "id": n, "cmd": "home"}                            모든 관절 0°로 이동
     {"type": "command", "id": n, "cmd": "stop"}                            그 자리에서 정지
@@ -63,7 +63,9 @@ class MockM0609:
         self.target = list(self.HOME)
         self.gripper = "OPEN"
         self.last_update = time.monotonic()
-        self.executed_ids = collections.deque(maxlen=50)  # 최근에 실행한 명령 id (중복 실행 방지, query 응답용)
+        # 최근에 실행한 명령의 (session, id). 중복 실행 방지와 query 응답에 쓴다.
+        # id는 클라이언트마다 1부터 다시 세므로, 어느 클라이언트(session)의 id인지까지 함께 기억해야 한다.
+        self.executed_ids = collections.deque(maxlen=50)
 
     def _update(self):
         """마지막 갱신 이후 흐른 시간만큼 관절을 목표 쪽으로 움직인다."""
@@ -119,16 +121,17 @@ def handle_command(robot, msg):
     """명령 하나를 실행하고, 클라이언트에게 돌려줄 ack 메시지를 만든다."""
     cmd = msg.get("cmd")
     cmd_id = msg.get("id")
+    session = msg.get("session")
     ack = {"type": "ack", "id": cmd_id, "cmd": cmd}
 
     if cmd == "query":
         # 읽기만 하는 명령이라 몇 번을 다시 보내도 안전하다. 실행 기록에도 남기지 않는다.
         ack["ok"] = True
         ack["status"] = robot.status()
-        ack["executed_ids"] = list(robot.executed_ids)
+        ack["executed_ids"] = [i for (s, i) in robot.executed_ids if s == session]
         return ack
 
-    if cmd_id in robot.executed_ids:
+    if (session, cmd_id) in robot.executed_ids:
         # 같은 명령이 다시 왔다(클라이언트가 ack를 못 받아서 재전송). 두 번 실행하지 않는다.
         ack["ok"] = True
         ack["duplicate"] = True
@@ -150,7 +153,7 @@ def handle_command(robot, msg):
         ack["error"] = str(e)
         return ack
 
-    robot.executed_ids.append(cmd_id)
+    robot.executed_ids.append((session, cmd_id))
     ack["ok"] = True
     return ack
 

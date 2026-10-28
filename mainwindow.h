@@ -92,6 +92,9 @@ private:
     QByteArray buffer;  // 아직 메시지 하나로 완성되지 않은 수신 바이트
     int lastSeq = -1;
     int nextCommandId = 1;  // 명령마다 붙이는 번호. ack가 어느 명령에 대한 것인지 맞춰 볼 때 쓴다.
+    // 앱이 켜질 때마다 새로 만드는 이름표. 앱을 다시 켜면 id가 1부터 다시 시작하므로,
+    // 브리지가 "이전 실행의 1번"과 "이번 실행의 1번"을 구분할 수 있게 모든 명령에 붙인다.
+    QString sessionId;
 
     QTimer *heartbeatTimer;  // 반복: 주기적으로 heartbeat 전송
     QTimer *watchdogTimer;   // 한 번: 데이터가 올 때마다 다시 시작. 울리면 "한동안 소식 없음"
