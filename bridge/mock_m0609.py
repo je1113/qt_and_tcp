@@ -282,8 +282,9 @@ async def handle_client(reader, writer, robot, faults, period, client_timeout):
         writer.close()
 
 
-async def main():
-    parser = argparse.ArgumentParser(description="모의 M0609 TCP 브리지")
+def make_arg_parser(description):
+    """브리지 공통 옵션. 다른 브리지(dsr_bridge.py)도 이 옵션을 그대로 쓴다."""
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--period", type=float, default=0.5, help="상태 전송 주기 [초]")
@@ -293,9 +294,11 @@ async def main():
     parser.add_argument("--loss", type=float, default=0.0, help="[장애] 메시지 유실 확률 (0~1)")
     parser.add_argument("--cut-rate", type=float, default=0.0, help="[장애] 1초당 연결 강제 끊김 확률 (0~1)")
     parser.add_argument("--seed", type=int, default=None, help="[장애] 무작위 시드 (같은 값이면 같은 장애)")
-    args = parser.parse_args()
+    return parser
 
-    robot = MockM0609()
+
+async def serve(robot, args, name):
+    """TCP 서버를 연다. robot은 movej/home/stop/grip/status와 executed_ids를 가진 객체면 된다."""
     faults = Faults(args.delay, args.loss, args.cut_rate, args.seed)
 
     server = await asyncio.start_server(
@@ -303,12 +306,17 @@ async def main():
         args.host,
         args.port,
     )
-    print(f"모의 M0609 브리지 대기 중: {args.host}:{args.port} (주기 {args.period}s)")
+    print(f"{name} 브리지 대기 중: {args.host}:{args.port} (주기 {args.period}s)")
     if args.delay or args.loss or args.cut_rate:
         print(f"[장애 주입] 지연 {args.delay}s, 유실 {args.loss:.0%}, 끊김 {args.cut_rate:.0%}/s, 시드 {args.seed}")
 
     async with server:
         await server.serve_forever()
+
+
+async def main():
+    args = make_arg_parser("모의 M0609 TCP 브리지").parse_args()
+    await serve(MockM0609(), args, "모의 M0609")
 
 
 if __name__ == "__main__":
