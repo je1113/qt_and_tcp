@@ -39,6 +39,8 @@ MainWindow::MainWindow(QWidget *parent)
     auto *jointForm = new QFormLayout;
     robotStateLabel = new QLabel("-");
     jointForm->addRow("state", robotStateLabel);
+    gripperLabel = new QLabel("-");
+    jointForm->addRow("gripper", gripperLabel);
     for (int i = 0; i < 6; ++i) {
         auto *label = new QLabel("-");
         jointForm->addRow(QString("J%1").arg(i + 1), label);
@@ -72,9 +74,43 @@ MainWindow::MainWindow(QWidget *parent)
     commandButtons->addWidget(homeButton);
     commandButtons->addWidget(stopButton);
 
+    pickButton = new QPushButton("피킹 시작");
+    pickLabel = new QLabel("피킹: 대기");
+    auto *pickRow = new QHBoxLayout;
+    pickRow->addWidget(pickButton);
+    pickRow->addWidget(pickLabel, 1);
+
     auto *commandLayout = new QVBoxLayout;
     commandLayout->addLayout(targetForm);
     commandLayout->addLayout(commandButtons);
+    commandLayout->addLayout(pickRow);
+
+    // 피스피킹 시퀀스: 집을 위치에서 물건을 집어 놓을 위치에 놓고 홈으로 돌아온다.
+    // 관절 각도는 연습용으로 정한 값이다(실제 작업 위치가 아님).
+    const auto movej = [](std::initializer_list<double> joints) {
+        QJsonArray array;
+        for (double j : joints)
+            array.append(j);
+        return QJsonObject{{"cmd", "movej"}, {"joints", array}};
+    };
+    const QJsonObject pickAbove = movej({-30, 10, 80, 0, 90, 0});
+    const QJsonObject pickDown = movej({-30, 25, 85, 0, 70, 0});
+    const QJsonObject placeAbove = movej({40, 10, 80, 0, 90, 0});
+    const QJsonObject placeDown = movej({40, 25, 85, 0, 70, 0});
+    const QJsonObject gripOpen{{"cmd", "grip"}, {"close", false}};
+    const QJsonObject gripClose{{"cmd", "grip"}, {"close", true}};
+    pickSteps = {
+        {"그리퍼 열기", gripOpen},
+        {"집을 위치 위", pickAbove},
+        {"하강", pickDown},
+        {"집기", gripClose},
+        {"상승", pickAbove},
+        {"놓을 위치 위", placeAbove},
+        {"하강", placeDown},
+        {"놓기", gripOpen},
+        {"상승", placeAbove},
+        {"홈", QJsonObject{{"cmd", "home"}}},
+    };
 
     auto *commandBox = new QGroupBox("명령");
     commandBox->setLayout(commandLayout);
@@ -127,6 +163,7 @@ MainWindow::MainWindow(QWidget *parent)
     connect(moveJButton, &QPushButton::clicked, this, &MainWindow::onMoveJClicked);
     connect(homeButton, &QPushButton::clicked, this, &MainWindow::onHomeClicked);
     connect(stopButton, &QPushButton::clicked, this, &MainWindow::onStopClicked);
+    connect(pickButton, &QPushButton::clicked, this, &MainWindow::onPickClicked);
     
     // 소켓 상태 변화/오류 → 우리 슬롯
     connect(socket, &QTcpSocket::stateChanged, this, &MainWindow::onStateChanged);
@@ -170,8 +207,10 @@ void MainWindow::startConnecting()
 
 void MainWindow::onDisconnectClicked()
 {
-    // 사용자가 직접 끊은 것이므로 재연결하지 않는다.
+    // 사용자가 직접 끊은 것이므로 재연결하지 않는다. 진행 중이던 일도 모두 그만둔다.
     autoReconnect = false;
+    abortPicking("연결 해제");
+    pendingCommand = QJsonObject();
     if (reconnectTimer->isActive()) {
         reconnectTimer->stop();
         appendLog("재연결 취소");
@@ -223,12 +262,21 @@ void MainWindow::onStateChanged(QAbstractSocket::SocketState state)
         reconnectDelayMs = InitialReconnectDelayMs;  // 연결에 성공했으니 다음 재연결은 처음 간격부터
         heartbeatTimer->start();
         watchdogTimer->start();
+
+        // 끊기기 전에 보낸 명령의 결과를 모른다. 추측하지 말고 로봇에게 실제 상태를 물어본다.
+        if (!pendingCommand.isEmpty()) {
+            appendLog(QString("재연결: #%1 %2의 실행 여부 확인")
+                          .arg(pendingCommand["id"].toInt()).arg(pendingCommand["cmd"].toString()));
+            queryRetries = 0;
+            sendQuery();
+        }
     } else if (state == QAbstractSocket::UnconnectedState) {
         heartbeatTimer->stop();
         watchdogTimer->stop();
         ackTimer->stop();
-        pendingCommandId = 0;
+        pendingQueryId = 0;  // 이 연결로 보낸 query의 응답은 이제 오지 않는다.
         robotState.clear();  // 연결이 없으면 로봇 상태도 알 수 없다.
+        // pendingCommand와 피킹 진행 상태는 지우지 않는다. 재연결 뒤 실제 상태를 보고 이어 간다.
 
         if (autoReconnect)
             scheduleReconnect();
@@ -253,10 +301,12 @@ void MainWindow::updateControls()
     // 재연결 모드 중이면(연결됨 / 연결 시도 중 / 재연결 대기 중) [해제]로 멈출 수 있다.
     disconnectButton->setEnabled(autoReconnect);
 
-    // 이동 명령: 연결됨 + 로봇이 멈춰 있음 + 응답을 기다리는 명령 없음
-    const bool canMove = connected && robotState == "IDLE" && pendingCommandId == 0;
+    // 이동 명령: 연결됨 + 로봇이 멈춰 있음 + 결과를 모르는 명령 없음 + 피킹 중 아님
+    const bool canMove = connected && robotState == "IDLE" && pendingCommand.isEmpty()
+                         && pendingQueryId == 0 && !picking;
     moveJButton->setEnabled(canMove);
     homeButton->setEnabled(canMove);
+    pickButton->setEnabled(canMove);
     for (QDoubleSpinBox *spin : targetSpins)
         spin->setEnabled(canMove);
 
@@ -317,35 +367,29 @@ void MainWindow::handleMessage(const QByteArray &body)
         const QString cmd = msg["cmd"].toString();
         const bool ok = msg["ok"].toBool();
 
-        const QString head = QString("← #%1 %2").arg(id).arg(cmd);
+        QString head = QString("← #%1 %2").arg(id).arg(cmd);
+        if (msg["duplicate"].toBool())
+            head += " (중복: 이미 실행됨)";
         if (ok)
             appendLog(head + " OK");
         else
             appendLog(head + " 실패: " + msg["error"].toString());
 
-        if (id == pendingCommandId) {
-            pendingCommandId = 0;
+        if (id == pendingQueryId) {
+            pendingQueryId = 0;
             ackTimer->stop();
-
-            // 이동 명령이 받아들여졌으면 다음 status가 오기 전이라도 "움직이는 중"으로 본다.
-            // 그러지 않으면 ack와 다음 status 사이(최대 0.5초) 동안 버튼이 잠깐 풀린다.
-            if (ok && cmd != "stop")
-                robotState = "MOVING";
-            updateControls();
+            handleQueryResult(msg);
+        } else if (!pendingCommand.isEmpty() && id == pendingCommand["id"].toInt()) {
+            confirmPendingCommand(ok, msg["error"].toString());
         }
+        // 그 밖의 ack(정지, 이미 결과를 확정한 명령의 늦은 ack 등)는 로그만 남긴다.
         return;
     }
 
     if (type != "status")
         return;
 
-    robotState = msg["state"].toString();
-    robotStateLabel->setText(robotState);
-    updateControls();
-
-    const QJsonArray joints = msg["joints"].toArray();
-    for (int i = 0; i < jointLabels.size() && i < joints.size(); ++i)
-        jointLabels[i]->setText(QString("%1°").arg(joints[i].toDouble(), 0, 'f', 2));
+    applyStatus(msg);
 
     const int seq = msg["seq"].toInt();
     seqLabel->setText(QString::number(seq));
@@ -372,6 +416,13 @@ void MainWindow::onHomeClicked()
 
 void MainWindow::onStopClicked()
 {
+    // 정지는 다른 모든 것보다 우선한다. 피킹을 멈추고, 결과를 기다리던 명령도 더 이상 신경 쓰지 않는다.
+    // (그 명령이 먼저 실행됐더라도 TCP는 순서를 지키므로 정지가 뒤에 실행되어 멈춘다.)
+    abortPicking("정지 버튼");
+    pendingCommand = QJsonObject();
+    pendingQueryId = 0;
+    ackTimer->stop();
+
     sendCommand(QJsonObject{{"cmd", "stop"}});
 }
 
@@ -383,9 +434,10 @@ void MainWindow::sendCommand(QJsonObject command)
 
     sendMessage(command);
 
-    // 정지는 언제든 누를 수 있어야 하므로 잠금 대상에서 뺀다. 나머지는 ack가 올 때까지 잠근다.
+    // 정지는 언제든 누를 수 있어야 하므로 잠금 대상에서 뺀다.
+    // 나머지는 실행 여부가 확정될 때까지 기억해 두고 버튼을 잠근다.
     if (command["cmd"].toString() != "stop") {
-        pendingCommandId = command["id"].toInt();
+        pendingCommand = command;
         ackTimer->start();
         updateControls();
     }
@@ -431,7 +483,148 @@ void MainWindow::onWatchdogTimeout()
 
 void MainWindow::onAckTimeout()
 {
-    appendLog(QString("⚠ #%1 응답 없음 (%2초)").arg(pendingCommandId).arg(AckTimeoutMs / 1000));
-    pendingCommandId = 0;
+    if (pendingQueryId != 0) {
+        // 상태를 물어본 query마저 응답이 없다. query는 읽기만 하므로 다시 물어봐도 안전하다.
+        if (++queryRetries > MaxQueryRetries) {
+            appendLog(QString("⚠ 재조회 %1회 실패 → 상태를 알 수 없어 중단").arg(MaxQueryRetries));
+            abortPicking("상태 확인 실패");
+            pendingCommand = QJsonObject();
+            pendingQueryId = 0;
+            updateControls();
+            return;
+        }
+        appendLog(QString("⚠ #%1 query 응답 없음 → 다시 조회 (%2/%3)")
+                      .arg(pendingQueryId).arg(queryRetries).arg(MaxQueryRetries));
+        sendQuery();
+        return;
+    }
+
+    if (pendingCommand.isEmpty())
+        return;
+
+    // ack가 안 왔다. 명령이 사라진 건지 ack만 사라진 건지 여기서는 알 수 없다.
+    // 그냥 다시 보내면 두 번 실행될 수도 있으니, 먼저 로봇의 실제 상태를 물어본다.
+    appendLog(QString("⚠ #%1 %2 응답 없음 (%3초) → 실제 상태 재조회")
+                  .arg(pendingCommand["id"].toInt()).arg(pendingCommand["cmd"].toString())
+                  .arg(AckTimeoutMs / 1000));
+    queryRetries = 0;
+    sendQuery();
+}
+
+void MainWindow::sendQuery()
+{
+    pendingQueryId = nextCommandId++;
+    sendMessage(QJsonObject{{"type", "command"}, {"id", pendingQueryId}, {"cmd", "query"}});
+    ackTimer->start();
+    appendLog(QString("→ #%1 query (실제 상태 재조회)").arg(pendingQueryId));
+    updateControls();
+}
+
+void MainWindow::handleQueryResult(const QJsonObject &msg)
+{
+    // 조회한 김에 화면도 실제 상태로 맞춘다. (status가 유실돼도 최신 상태를 알 수 있다)
+    applyStatus(msg["status"].toObject());
+
+    if (pendingCommand.isEmpty())
+        return;  // 그사이 늦은 ack가 와서 이미 확정됐다.
+
+    const QJsonArray executedIds = msg["executed_ids"].toArray();
+    const int id = pendingCommand["id"].toInt();
+
+    if (executedIds.contains(id)){
+        appendLog(QString("✔ #%1 실행된 것 확인 (ack만 유실) → 진행").arg(id));
+        confirmPendingCommand(true);
+    }else{
+        appendLog(QString("✘ #%1 실행 안 된 것 확인 (명령 유실) → 같은 id로 재전송").arg(id));
+        resendPendingCommand();
+    }
+}
+
+void MainWindow::confirmPendingCommand(bool ok, const QString &error)
+{
+    const QString cmd = pendingCommand["cmd"].toString();
+    pendingCommand = QJsonObject();
+    pendingQueryId = 0;  // 이미 확정됐으니 진행 중인 재조회의 결과는 필요 없다.
+    ackTimer->stop();
+
+    // 명령이 받아들여졌으면 다음 status가 오기 전이라도 "움직이는 중"으로 본다.
+    // 그러지 않으면 확정과 다음 status 사이(최대 0.5초) 동안 버튼이 풀리거나, 피킹이 도착 전에 다음 단계로 넘어간다.
+    if (ok)
+        robotState = "MOVING";
+
+    if (picking) {
+        if (ok)
+            stepAcked = true;
+        else
+            abortPicking(QString("%1 실패: %2").arg(cmd, error));
+    }
+
+    updateControls();
+    tryAdvancePicking();
+}
+
+void MainWindow::resendPendingCommand()
+{
+    // 같은 id로 다시 보낸다. 혹시 앞의 것이 늦게라도 실행됐다면 브리지가 중복으로 보고 무시한다.
+    sendMessage(pendingCommand);
+    ackTimer->start();
+    appendLog(QString("↻ #%1 %2 재전송").arg(pendingCommand["id"].toInt()).arg(pendingCommand["cmd"].toString()));
+}
+
+void MainWindow::applyStatus(const QJsonObject &status)
+{
+    robotState = status["state"].toString();
+    robotStateLabel->setText(robotState);
+    gripperLabel->setText(status["gripper"].toString());
+
+    const QJsonArray joints = status["joints"].toArray();
+    for (int i = 0; i < jointLabels.size() && i < joints.size(); ++i)
+        jointLabels[i]->setText(QString("%1°").arg(joints[i].toDouble(), 0, 'f', 2));
+
+    updateControls();
+    tryAdvancePicking();
+}
+
+void MainWindow::onPickClicked()
+{
+    picking = true;
+    pickStep = 0;
+    appendLog("■ 피킹 시작");
+    runPickStep();
+}
+
+void MainWindow::runPickStep()
+{
+    const PickStep &step = pickSteps[pickStep];
+    stepAcked = false;
+    pickLabel->setText(QString("피킹: %1/%2 %3").arg(pickStep + 1).arg(pickSteps.size()).arg(step.name));
+    appendLog("▶ " + pickLabel->text());
+    sendCommand(step.command);
+}
+
+void MainWindow::tryAdvancePicking()
+{
+    // 다음 단계로 넘어가는 조건: 지금 단계 명령이 실행된 게 확인됐고, 로봇이 도착해서 멈춰 있음
+    if (!picking || !stepAcked || robotState != "IDLE" || !pendingCommand.isEmpty())
+        return;
+
+    ++pickStep;
+    if (pickStep == pickSteps.size()) {
+        picking = false;
+        pickLabel->setText("피킹: 완료");
+        appendLog("■ 피킹 완료");
+        updateControls();
+        return;
+    }
+    runPickStep();
+}
+
+void MainWindow::abortPicking(const QString &reason)
+{
+    if (!picking)
+        return;
+    picking = false;
+    pickLabel->setText(QString("피킹: 중단 (%1/%2)").arg(pickStep + 1).arg(pickSteps.size()));
+    appendLog("■ 피킹 중단: " + reason);
     updateControls();
 }
