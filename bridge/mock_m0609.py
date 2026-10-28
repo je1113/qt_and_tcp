@@ -2,10 +2,13 @@
 
 실제 로봇 대신 가짜 M0609의 상태를 만들어, 접속한 TCP 클라이언트(Qt 앱)에게 주기적으로 보낸다.
 
-프로토콜: 한 줄에 JSON 하나 (UTF-8, '\\n'으로 끝남)
-    {"type": "status", "state": "MOVING", "joints": [j1, ..., j6]}
-    - state : "IDLE" 또는 "MOVING"
-    - joints: 관절 6개의 각도 [deg]
+프로토콜: [길이 헤더 4바이트][JSON 본문]
+    - 길이 헤더: 본문의 바이트 수. uint32, 빅엔디언(네트워크 바이트 순서)
+    - 본문    : UTF-8 JSON
+        {"type": "status", "state": "MOVING", "joints": [j1, ..., j6], "seq": n}
+        - state : "IDLE" 또는 "MOVING"
+        - joints: 관절 6개의 각도 [deg]
+        - seq   : 연결마다 0부터 1씩 증가하는 메시지 번호
 
 실행: python3 bridge/mock_m0609.py [--port 5000] [--period 0.5]
 """
@@ -14,6 +17,7 @@ import argparse
 import asyncio
 import json
 import math
+import struct
 import time
 
 
@@ -51,8 +55,9 @@ async def handle_client(reader, writer, robot, period):
         while True:
             msg = robot.status()
             msg["seq"] = seq
-            line = json.dumps(msg) + "\n"
-            writer.write(line.encode("utf-8"))
+            body = json.dumps(msg).encode("utf-8")
+            header = struct.pack(">I", len(body))   # > = 빅엔디언, I = uint32 (4바이트)
+            writer.write(header + body)
             await writer.drain()          # 실제로 보내질 때까지 (다른 클라이언트를 막지 않고) 기다림
             await asyncio.sleep(period)
             seq = seq + 1
