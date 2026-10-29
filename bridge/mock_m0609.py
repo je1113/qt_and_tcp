@@ -36,6 +36,8 @@
     --loss 0.2      메시지(양방향)를 20% 확률로 버린다
     --cut-rate 0.05 1초마다 5% 확률로 연결을 강제로 끊는다
     --seed 1        무작위 값을 고정해서 같은 장애를 다시 재현한다
+    --split         메시지마다 반으로 잘라 앞부분을 먼저, 나머지를 0.2초 뒤에 보낸다
+                    (TCP에서 메시지가 쪼개지거나 붙어 오는 상황 재현)
 """
 
 import argparse
@@ -161,8 +163,9 @@ def handle_command(robot, msg):
 class Faults:
     """장애 주입 설정. 연결마다 하나씩 만들지 않고 모든 연결이 같이 쓴다."""
 
-    def __init__(self, delay, loss, cut_rate, seed):
+    def __init__(self, delay, loss, cut_rate, seed, split=False):
         self.delay = delay
+        self.split = split
         self.loss = loss
         self.cut_rate = cut_rate
         self.rng = random.Random(seed)
@@ -178,10 +181,14 @@ class Faults:
 class Link:
     """연결 하나. 메시지를 보낼 때 장애(유실, 지연)를 적용한다."""
 
+    SPLIT_GAP = 0.2   # 쪼갠 메시지의 앞부분과 뒷부분 사이 간격 [초]
+
     def __init__(self, writer, faults, addr):
         self.writer = writer
         self.faults = faults
         self.addr = addr
+        self.splitting = False   # 쪼갠 메시지의 뒷부분을 아직 안 보냈는가
+        self.waiting = []        # 그동안 보낼 메시지. 먼저 내보내면 뒷부분과 바이트가 섞인다.
 
     def send(self, msg):
         if self.faults.lose():
@@ -196,19 +203,38 @@ class Link:
             self._write(msg)
 
     def _write(self, msg):
+        if self.writer.is_closing():
+            return
+        frame = encode_message(msg)
+
+        if self.splitting:
+            self.waiting.append(frame)
+        elif self.faults.split:
+            # 쪼개짐: 앞부분만 먼저 보낸다. 받는 쪽은 메시지 반 개만 받은 상태가 된다.
+            cut = len(frame) // 2
+            self.writer.write(frame[:cut])
+            self.splitting = True
+            asyncio.get_running_loop().call_later(self.SPLIT_GAP, self._write_rest, frame[cut:])
+        else:
+            self.writer.write(frame)
+
+    def _write_rest(self, rest):
+        """쪼갠 메시지의 뒷부분과, 기다리던 메시지를 한 번에 보낸다(= 붙어 옴)."""
+        self.splitting = False
         if not self.writer.is_closing():
-            send_message(self.writer, msg)
+            self.writer.write(rest + b"".join(self.waiting))
+        self.waiting.clear()
 
     def cut(self):
         print(f"[장애] {self.addr}: 연결 강제 끊김")
         self.writer.transport.abort()
 
 
-def send_message(writer, msg):
-    """메시지 하나를 [길이 헤더][JSON]으로 보낸다. 한 번의 write로 보내서 다른 메시지와 섞이지 않는다."""
+def encode_message(msg):
+    """메시지 하나를 [길이 헤더][JSON] 바이트로 만든다. 한 번의 write로 보내면 다른 메시지와 섞이지 않는다."""
     body = json.dumps(msg, ensure_ascii=False).encode("utf-8")
     header = struct.pack(">I", len(body))   # > = 빅엔디언, I = uint32 (4바이트)
-    writer.write(header + body)
+    return header + body
 
 
 async def read_message(reader, timeout):
@@ -297,12 +323,13 @@ def make_arg_parser(description):
     parser.add_argument("--loss", type=float, default=0.0, help="[장애] 메시지 유실 확률 (0~1)")
     parser.add_argument("--cut-rate", type=float, default=0.0, help="[장애] 1초당 연결 강제 끊김 확률 (0~1)")
     parser.add_argument("--seed", type=int, default=None, help="[장애] 무작위 시드 (같은 값이면 같은 장애)")
+    parser.add_argument("--split", action="store_true", help="[장애] 메시지를 반으로 잘라 시간차를 두고 보내기")
     return parser
 
 
 async def serve(robot, args, name):
     """TCP 서버를 연다. robot은 movej/home/stop/grip/status와 executed_ids를 가진 객체면 된다."""
-    faults = Faults(args.delay, args.loss, args.cut_rate, args.seed)
+    faults = Faults(args.delay, args.loss, args.cut_rate, args.seed, args.split)
 
     server = await asyncio.start_server(
         lambda r, w: handle_client(r, w, robot, faults, args.period, args.client_timeout),
@@ -310,8 +337,9 @@ async def serve(robot, args, name):
         args.port,
     )
     print(f"{name} 브리지 대기 중: {args.host}:{args.port} (주기 {args.period}s)")
-    if args.delay or args.loss or args.cut_rate:
-        print(f"[장애 주입] 지연 {args.delay}s, 유실 {args.loss:.0%}, 끊김 {args.cut_rate:.0%}/s, 시드 {args.seed}")
+    if args.delay or args.loss or args.cut_rate or args.split:
+        print(f"[장애 주입] 지연 {args.delay}s, 유실 {args.loss:.0%}, 끊김 {args.cut_rate:.0%}/s, "
+              f"쪼개기 {'켜짐' if args.split else '꺼짐'}, 시드 {args.seed}")
 
     async with server:
         await server.serve_forever()
